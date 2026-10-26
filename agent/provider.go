@@ -428,9 +428,17 @@ type quotaAwareTransport struct {
 	// carries; its value is the session id read from the request context. Empty
 	// disables it. See Config.SessionHeaderKey.
 	sessionHeaderKey string
+	// userAgent, when non-empty, is stamped on requests that did not set their
+	// own. See LLMUserAgent.
+	userAgent string
 }
 
 func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Identify the client. Third-party gateways that watch for abuse (OpenCode Go)
+	// ask that a client name itself instead of defaulting to "Go-http-client/1.1".
+	if t.userAgent != "" && req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", t.userAgent)
+	}
 	// Custom session-id header: name is user-configured, value is THIS run's
 	// session id (norma stashes it on the context via transcript.WithSessionID).
 	// Stable across a session's turns and distinct across sessions — exactly what
@@ -492,6 +500,26 @@ func requestBodySnapshot(req *http.Request) string {
 	return string(b)
 }
 
+// LLMUserAgent is the User-Agent sent on every LLM HTTP request. Without it Go
+// sends the generic "Go-http-client/1.1", which gateways that police third-party
+// traffic (OpenCode Go monitors clients for abuse and asks that a client identify
+// itself rather than look like a bare HTTP library) treat as untrusted. cmd/artex
+// overrides this with the build version at startup; ARTEX_LLM_USER_AGENT wins over
+// both. An explicit User-Agent already set on the request is never overwritten.
+var LLMUserAgent = "artex/dev"
+
+// llmUserAgent resolves the effective agent: env override > LLMUserAgent > the
+// built-in default.
+func llmUserAgent() string {
+	if v := strings.TrimSpace(os.Getenv("ARTEX_LLM_USER_AGENT")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(LLMUserAgent); v != "" {
+		return v
+	}
+	return "artex"
+}
+
 func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	proxy = strings.TrimSpace(proxy)
@@ -511,7 +539,11 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) 
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
-	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey)}}, nil
+	return &http.Client{Transport: quotaAwareTransport{
+		base:             transport,
+		sessionHeaderKey: strings.TrimSpace(sessionHeaderKey),
+		userAgent:        llmUserAgent(),
+	}}, nil
 }
 
 // logTestConnection prints the raw HTTP status code(s) and response body of a
