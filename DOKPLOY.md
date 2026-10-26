@@ -68,14 +68,30 @@ dig +short artex.example.com
 
 ### 3. Deploy
 
-Hit **Deploy**. First build with `ARTEX_BUILD_TARGET=runtime` takes roughly 15–25 minutes
+Hit **Deploy**. First build with `ARTEX_BUILD_TARGET=runtime` takes roughly 10–25 minutes
 (Go + Node compilation, then nmap/nuclei/httpx/subfinder/katana/ffuf/dalfox/sqlmap/bbot and
 Playwright + Chromium). `runtime-slim` builds in about 5 minutes and is enough to validate the
 stack end to end.
 
 Watch progress in the Dokploy deployment log; **Logs** on the service shows runtime output.
 
-### 4. First login
+### 4. Domain
+
+Service → **Domains → Add Domain**:
+
+| Field | Value |
+|---|---|
+| Service Name | `artex` (not `postgres`) |
+| Host | `artex.hacksubset.com` |
+| Container Port | `8787` |
+| HTTPS | on |
+| Certificate Provider | `None` on a Cloudflare-proxied zone (see [TLS](#tls-on-this-install)) |
+
+Dokploy writes the router into `/etc/dokploy/traefik/dynamic/<app>.yml` at the next deploy — so
+**redeploy after adding the domain**. Do not also declare Traefik labels in the compose file for
+the same host: two routers on the same `Host()` rule is undefined behaviour.
+
+### 5. First login
 
 1. Open `https://artex.example.com` → redirected to `/setup`.
 2. Set the admin password (nothing is seeded; the first visit creates it).
@@ -113,15 +129,29 @@ curl -s localhost:8787/api/health     # only reachable with ports: published
 |---|---|---|
 | `image: autumn27/artex` | `build: Dockerfile.dokploy` | English fork source, no registry credential needed |
 | `./data:/app/data`, `./skills:/app/skills` bind mounts | named volumes `artex-data`, `artex-state`; skills baked into the image | Dokploy re-clones the repo on every deploy, so bind mounts into the checkout are not durable |
-| publishes `8787:8787` and `127.0.0.1:8788:8788` | `expose: 8787` + Traefik labels; proxy stays private | Traefik terminates TLS and routes; the MITM proxy must not be internet-facing |
+| publishes `8787:8787` and `127.0.0.1:8788:8788` | `expose: 8787` only; the Dokploy domain routes to it; proxy stays private | Traefik terminates TLS and routes; the MITM proxy must not be internet-facing |
 | no healthcheck on `artex` | `GET /api/health` healthcheck | Dokploy/Traefik need a readiness signal, and the DB-backed boot is slow on first start |
 
-Routing is declared with Traefik **docker labels** (`traefik.enable`, `traefik.docker.network`,
-router rule on `ARTEX_HOST`, `tls: true`), so no entry in Dokploy's *Domains* tab is required and
-no per-host dynamic config file is generated. Do not add the same host in both places: that
-creates a second router for the same `Host()` rule. If your Dokploy install does have a working
-ACME resolver, add `traefik.http.routers.artex.tls.certresolver=<name>` back — but a resolver name
-that does not exist in `traefik.yml` makes Traefik discard the router entirely.
+Routing is owned by Dokploy's **Domains** tab (it generates a file-provider router per host). The
+compose file deliberately declares no Traefik labels, so there is exactly one router for the host.
+If you prefer labels-as-code instead, remove the Domains entry and use
+`traefik.enable` + `traefik.docker.network=dokploy-network` +
+`traefik.http.routers.<name>.rule` + `.entrypoints=websecure` + `.tls=true` +
+`traefik.http.services.<name>.loadbalancer.server.port=8787` — and never both.
+
+### TLS on this install
+
+Verified on the target Dokploy v0.30.10 host: `/etc/dokploy/traefik/traefik.yml` declares **no
+`certificatesResolvers`**, while `/etc/dokploy/traefik/dynamic/cloudflare-cert.yml` loads a
+Cloudflare **origin** certificate as the default. Client-facing TLS is terminated at the Cloudflare
+edge, so:
+
+* Keep the DNS record **proxied (orange cloud)**. A DNS-only record exposes the origin certificate
+  directly and browsers will reject it.
+* Pick Certificate Provider **None** in the Domains dialog (Traefik then selects the matching
+  certificate from `Settings → Certificates` by SNI).
+* Do not set `tls.certresolver` — naming a resolver that does not exist makes Traefik drop the
+  router.
 
 The `jwt.key` detail is worth knowing: ARTEX stores the signing key next to the executable
 (`/app`), deliberately *outside* the agent-browsable `/app/data` workspace, so a redeploy
