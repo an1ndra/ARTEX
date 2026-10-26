@@ -56,7 +56,7 @@ RUN go build \
       -ldflags "-s -w -buildid= -X main.version=${ARTEX_VERSION}" \
       -o /out/artex \
       ./cmd/artex \
-    && /out/artex --help >/dev/null 2>&1 || true
+    && test -x /out/artex
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 3a — full recon toolbox (mirrors the upstream runtime image)
