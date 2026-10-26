@@ -56,9 +56,11 @@ the UI under **LLM Configuration** after the first login.
 
 ### 2. DNS
 
-Add `A artex.example.com → <Dokploy server IP>` (DNS-only / grey cloud is the simplest way to
-get a Let's Encrypt HTTP-01 certificate; through the Cloudflare proxy it still works as long as
-SSL mode is **Full** or **Full (strict)**). Verify before deploying:
+Add `A artex.example.com → <Dokploy server IP>` and keep it **proxied (orange cloud)** if the zone
+is on Cloudflare. This deployment's Traefik install has no ACME resolver configured
+(`traefik.yml` defines no `certificatesResolvers`); the edge certificate comes from Cloudflare and
+Traefik serves the default Cloudflare origin certificate behind it. A DNS-only record would expose
+that origin certificate directly to browsers, which do not trust it. Verify before deploying:
 
 ```bash
 dig +short artex.example.com
@@ -114,6 +116,13 @@ curl -s localhost:8787/api/health     # only reachable with ports: published
 | publishes `8787:8787` and `127.0.0.1:8788:8788` | `expose: 8787` + Traefik labels; proxy stays private | Traefik terminates TLS and routes; the MITM proxy must not be internet-facing |
 | no healthcheck on `artex` | `GET /api/health` healthcheck | Dokploy/Traefik need a readiness signal, and the DB-backed boot is slow on first start |
 
+Routing is declared with Traefik **docker labels** (`traefik.enable`, `traefik.docker.network`,
+router rule on `ARTEX_HOST`, `tls: true`), so no entry in Dokploy's *Domains* tab is required and
+no per-host dynamic config file is generated. Do not add the same host in both places: that
+creates a second router for the same `Host()` rule. If your Dokploy install does have a working
+ACME resolver, add `traefik.http.routers.artex.tls.certresolver=<name>` back — but a resolver name
+that does not exist in `traefik.yml` makes Traefik discard the router entirely.
+
 The `jwt.key` detail is worth knowing: ARTEX stores the signing key next to the executable
 (`/app`), deliberately *outside* the agent-browsable `/app/data` workspace, so a redeploy
 otherwise invalidates every session. The Dockerfile symlinks `/app/jwt.key` →
@@ -137,6 +146,10 @@ key into `/app/data` — the workspace file manager would then expose it.
   Running two stacks on one Dokploy host requires giving each its own router names.
 * **Concurrency/memory**: each worker runs real CLI tools; size the server accordingly
   (~1 GB RAM idle, more per concurrent worker).
+* **Cloudflare in front**: SSE (`/api/logs/stream`, `/api/exploration/activity/stream`) works
+  through the proxy, but the free plan drops idle connections after ~100 s. If the activity
+  stream stalls on long-idle tasks, that is the edge, not ARTEX — bypass the proxy for that host
+  or add a keepalive.
 
 ## Security notes
 
