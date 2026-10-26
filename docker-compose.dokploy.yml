@@ -79,16 +79,15 @@ services:
     labels:
       traefik.enable: "true"
       traefik.docker.network: dokploy-network
-      # HTTP → HTTPS redirect
-      traefik.http.middlewares.artex-redirect.redirectscheme.scheme: https
-      traefik.http.routers.artex-http.rule: Host(`${ARTEX_HOST:-artex.localhost}`)
-      traefik.http.routers.artex-http.entrypoints: web
-      traefik.http.routers.artex-http.middlewares: artex-redirect
-      # HTTPS router. SSE (/api/.../events) is served by the same backend port; Traefik streams
-      # it without buffering, no extra configuration needed.
+      # `web` → `websecure` redirect is already global on this Traefik install
+      # (entryPoints.web.http.redirections), so only the secure router is declared.
+      # No certResolver label: this Dokploy install has no ACME resolver configured in
+      # traefik.yml — TLS is terminated at the Cloudflare edge and Traefik serves the
+      # default (Cloudflare origin) certificate. Declaring a resolver that does not exist
+      # makes Traefik drop the router.
       traefik.http.routers.artex.rule: Host(`${ARTEX_HOST:-artex.localhost}`)
       traefik.http.routers.artex.entrypoints: websecure
-      traefik.http.routers.artex.tls.certresolver: ${ARTEX_CERT_RESOLVER:-letsencrypt}
+      traefik.http.routers.artex.tls: "true"
       traefik.http.services.artex.loadbalancer.server.port: "8787"
 
 volumes:
