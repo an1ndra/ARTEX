@@ -1,0 +1,173 @@
+# syntax=docker/dockerfile:1
+#
+# Self-contained image build for PaaS hosting (Dokploy, Coolify, any `docker compose build`).
+#
+# Why this file exists: the upstream `Dockerfile` does NOT compile anything. It copies a
+# pre-built binary from `dist/${TARGETARCH}/artex`, which is gitignored and only produced by
+# the maintainer's CI job. A plain `git clone` therefore cannot build that image — the build
+# fails on `COPY dist/...`. This Dockerfile builds the frontend and the Go binary from source
+# in multi-stage fashion, then produces the same runtime layout as upstream.
+#
+# Stages:
+#   runtime-slim : app only (no recon tooling) — ~200 MB, boots in seconds
+#   runtime      : app + full recon toolbox (nmap, nuclei, httpx, subfinder, katana, ffuf,
+#                  dalfox, sqlmap, bbot, Playwright/Chromium) — what agents actually need
+#
+# Build args:
+#   ARTEX_VERSION=0.4.0        version string reported by /api/health
+#   NODE_VERSION=24            frontend build image tag
+#   GO_VERSION=1.26            backend build image tag (go.mod requires >= 1.26.3)
+
+ARG NODE_VERSION=24
+ARG GO_VERSION=1.26
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1 — frontend static export (web/out)
+# ─────────────────────────────────────────────────────────────────────────────
+FROM node:${NODE_VERSION}-bookworm-slim AS web
+WORKDIR /web
+ENV NEXT_TELEMETRY_DISABLED=1 \
+    CI=1 \
+    HUSKY=0 \
+    NODE_OPTIONS=--max-old-space-size=4096
+COPY web/package.json web/package-lock.json ./
+# HUSKY=0 keeps the `prepare` hook from failing outside a git checkout.
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+# Next static export (output: "export") → /web/out
+RUN npm run build:static
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2 — backend single binary with the frontend embedded (go:embed)
+# ─────────────────────────────────────────────────────────────────────────────
+FROM golang:${GO_VERSION}-bookworm AS build
+ARG ARTEX_VERSION=0.4.0
+WORKDIR /src
+ENV CGO_ENABLED=0 \
+    GOFLAGS=-mod=mod
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+# server/webui_embed.go embeds `all:webui/dist`; the path is gitignored, so it is created here.
+COPY --from=web /web/out ./server/webui/dist
+RUN go build \
+      -tags embedui \
+      -trimpath \
+      -ldflags "-s -w -buildid= -X main.version=${ARTEX_VERSION}" \
+      -o /out/artex \
+      ./cmd/artex \
+    && /out/artex --help >/dev/null 2>&1 || true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 3a — full recon toolbox (mirrors the upstream runtime image)
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.12-slim-bookworm AS tools
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates ripgrep curl wget vim git jq unzip less procps tini \
+      dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Web-recon toolbox: pinned release binaries into /usr/local/bin so workers can call them
+# directly from their Bash tool. sqlmap is a python checkout symlinked into PATH.
+ARG NUCLEI_VERSION=v3.11.1
+ARG HTTPX_VERSION=v1.12.0
+ARG SUBFINDER_VERSION=v2.17.0
+ARG KATANA_VERSION=v1.8.0
+ARG FFUF_VERSION=v2.3.0
+ARG DALFOX_VERSION=v3.2.4
+RUN set -eux; \
+    base="https://github.com"; \
+    pd_fetch() { repo="$1"; ver="$2"; name="$3"; nov="${ver#v}"; \
+      curl -fsSL "$base/$repo/releases/download/$ver/${name}_${nov}_linux_${TARGETARCH}.zip" -o /tmp/t.zip \
+      && unzip -o -q /tmp/t.zip -d /tmp/td \
+      && find /tmp/td -type f -name "$name" -exec install -m 0755 {} /usr/local/bin/ \; \
+      && rm -rf /tmp/t.zip /tmp/td; }; \
+    case "$TARGETARCH" in amd64) FFUF_ARCH=amd64; DALFOX_ARCH=x86_64;; arm64) FFUF_ARCH=arm64; DALFOX_ARCH=aarch64;; esac; \
+    pd_fetch projectdiscovery/nuclei "$NUCLEI_VERSION" nuclei; \
+    pd_fetch projectdiscovery/httpx "$HTTPX_VERSION" httpx; \
+    pd_fetch projectdiscovery/subfinder "$SUBFINDER_VERSION" subfinder; \
+    pd_fetch projectdiscovery/katana "$KATANA_VERSION" katana; \
+    tar_fetch() { url="$1"; name="$2"; \
+      curl -fsSL "$url" -o /tmp/t.tgz \
+      && mkdir -p /tmp/td && tar -xzf /tmp/t.tgz -C /tmp/td \
+      && find /tmp/td -type f -name "$name" -exec install -m 0755 {} /usr/local/bin/ \; \
+      && rm -rf /tmp/t.tgz /tmp/td; }; \
+    tar_fetch "$base/ffuf/ffuf/releases/download/$FFUF_VERSION/ffuf_${FFUF_VERSION#v}_linux_${FFUF_ARCH}.tar.gz" ffuf; \
+    tar_fetch "$base/hahwul/dalfox/releases/download/$DALFOX_VERSION/dalfox-${DALFOX_VERSION}-linux-${DALFOX_ARCH}-musl.tar.gz" dalfox; \
+    git clone --depth 1 https://github.com/sqlmapproject/sqlmap /opt/sqlmap; \
+    ln -s /opt/sqlmap/sqlmap.py /usr/local/bin/sqlmap; \
+    nuclei -version >/dev/null; httpx -version; subfinder -version; katana -version; \
+    ffuf -V >/dev/null; dalfox --version >/dev/null 2>&1 || true; sqlmap --version >/dev/null
+
+# bbot recursive recon orchestrator (AGPL-3.0, standalone CLI). Own venv, deps preinstalled
+# so runtime scans never need pip (which fails behind egress allowlists).
+ARG BBOT_VERSION=3.0.2
+ARG WITH_BBOT=1
+RUN set -eux; \
+    if [ "$WITH_BBOT" = "1" ]; then \
+      python -m venv /opt/bbot; \
+      /opt/bbot/bin/pip install --no-cache-dir "bbot==${BBOT_VERSION}"; \
+      ln -s /opt/bbot/bin/bbot /usr/local/bin/bbot; \
+      bbot -y --install-all-deps; \
+      bbot --version >/dev/null; \
+    fi
+
+# Playwright MCP + CLI, and Chromium with system deps, so no network download at runtime.
+ARG WITH_PLAYWRIGHT=1
+RUN set -eux; \
+    if [ "$WITH_PLAYWRIGHT" = "1" ]; then \
+      npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest; \
+      playwright-cli --help >/dev/null; \
+      playwright install --with-deps chromium; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 3b — slim runtime (no recon tooling)
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.12-slim-bookworm AS runtime-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates ripgrep curl wget git jq unzip tini \
+      dnsutils netcat-openbsd procps \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+ARG ARTEX_VERSION=0.4.0
+ENV ARTEX_VERSION=${ARTEX_VERSION}
+COPY --from=build /out/artex /app/artex
+COPY start.sh /app/start.sh
+COPY skills/ /app/skills/
+# The JWT signing key lives next to the executable (keyDir = /app), deliberately OUTSIDE the
+# browsable workspace (/app/data) so agents cannot read it. Redirect it into its own persisted
+# volume, otherwise every container recreate invalidates all sessions.
+RUN chmod +x /app/artex /app/start.sh \
+    && mkdir -p /app/data /app/.state \
+    && ln -sfn /app/.state/jwt.key /app/jwt.key
+VOLUME ["/app/data", "/app/.state"]
+EXPOSE 8787 8788
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8787/api/health || exit 1
+ENTRYPOINT ["/app/start.sh"]
+CMD ["-addr", ":8787", "-proxy", "127.0.0.1:8788"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 3c — full runtime (default)
+# ─────────────────────────────────────────────────────────────────────────────
+FROM tools AS runtime
+WORKDIR /app
+ARG ARTEX_VERSION=0.4.0
+ENV ARTEX_VERSION=${ARTEX_VERSION}
+COPY --from=build /out/artex /app/artex
+COPY start.sh /app/start.sh
+COPY skills/ /app/skills/
+RUN chmod +x /app/artex /app/start.sh \
+    && mkdir -p /app/data /app/.state \
+    && ln -sfn /app/.state/jwt.key /app/jwt.key
+VOLUME ["/app/data", "/app/.state"]
+EXPOSE 8787 8788
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8787/api/health || exit 1
+ENTRYPOINT ["/app/start.sh"]
+CMD ["-addr", ":8787", "-proxy", "127.0.0.1:8788"]
